@@ -1,7 +1,9 @@
 "use strict";
 
 const { expect } = require("chai");
+const zlib = require("zlib");
 const Zip = require("../adm-zip");
+const Utils = require("../util");
 
 // Regression test for CVE-2026-39244:
 // adm-zip allocated the entry output buffer from the attacker-declared
@@ -22,10 +24,11 @@ const u32 = (n) => {
 };
 
 // Build a single-entry zip that declares `declaredSize` uncompressed bytes while
-// only carrying `content` bytes of (crc-invalid) payload.
-function craftBomb(declaredSize, method, content) {
+// only carrying `content` bytes of (crc-invalid) payload. Pass `realCrc` to make
+// the entry crc-valid, so only the declared size is lying.
+function craftBomb(declaredSize, method, content, realCrc) {
     const name = Buffer.from("a");
-    const crc = 0; // deliberately wrong: alloc used to happen before the crc check
+    const crc = realCrc === undefined ? 0 : realCrc; // deliberately wrong by default: alloc used to happen before the crc check
     const lfh = Buffer.concat([
         u32(0x04034b50),
         u16(20),
@@ -99,5 +102,93 @@ describe("decompression bomb (declared size) - CVE-2026-39244", () => {
         zip.addFile("d.txt", payload);
         const round = new Zip(zip.toBuffer());
         expect(round.readFile("d.txt").equals(payload)).to.equal(true);
+    });
+});
+
+describe("decompression bomb (async size cap) - GHSA-c6fg-446q-cg94", () => {
+    // Regression test for GHSA-c6fg-446q-cg94: getDataAsync() inflated through
+    // zlib.createInflateRaw, whose streaming API ignores maxOutputLength, so an
+    // entry declaring a tiny uncompressed size inflated without limit on the async
+    // path while the synchronous getData() path was capped at the declared size.
+    const nodeMajor = +(process.versions ? process.versions.node : "").split(".")[0] || 0;
+    // 1 MB of repeated bytes deflates to ~1 KB and inflates over many zlib chunks
+    const payload = Buffer.alloc(1024 * 1024, 0x41);
+    const deflated = zlib.deflateRawSync(payload);
+    const crc = Utils.crc32(payload);
+
+    // the async read must fail with the size error and hand back no data
+    const expectRejected = (data, err) => {
+        expect(err, "async read must fail instead of inflating past the declared size").to.be.an("error");
+        expect(err.message).to.contain("exceeds the declared uncompressed size");
+        expect(data.length, "no inflated data may be returned").to.equal(0);
+    };
+
+    it("getDataAsync rejects an entry that inflates beyond its declared size, like getData", (done) => {
+        const entry = new Zip(craftBomb(16, 8 /* DEFLATED */, deflated, crc)).getEntries()[0];
+        if (nodeMajor >= 15) {
+            // zlib supports maxOutputLength on Node >= 15 only: the sync path is capped there
+            expect(() => entry.getData()).to.throw();
+        }
+        entry.getDataAsync((data, err) => {
+            try {
+                expectRejected(data, err);
+                done();
+            } catch (e) {
+                done(e);
+            }
+        });
+    });
+
+    it("readFileAsync rejects a bomb that declares an uncompressed size of 0", (done) => {
+        const zip = new Zip(craftBomb(0, 8 /* DEFLATED */, deflated, crc));
+        zip.readFileAsync("a", (data, err) => {
+            try {
+                expectRejected(data, err);
+                done();
+            } catch (e) {
+                done(e);
+            }
+        });
+    });
+
+    it("readAsTextAsync rejects an entry that inflates beyond its declared size", (done) => {
+        const zip = new Zip(craftBomb(1024, 8 /* DEFLATED */, deflated, crc));
+        zip.readAsTextAsync("a", (data, err) => {
+            try {
+                expectRejected(data, err);
+                done();
+            } catch (e) {
+                done(e);
+            }
+        });
+    });
+
+    it("getDataAsync still inflates an entry whose data matches its declared size", (done) => {
+        const entry = new Zip(craftBomb(payload.length, 8 /* DEFLATED */, deflated, crc)).getEntries()[0];
+        expect(entry.getData().equals(payload)).to.equal(true);
+        entry.getDataAsync((data, err) => {
+            try {
+                expect(err).to.equal(undefined);
+                expect(data.equals(payload)).to.equal(true);
+                done();
+            } catch (e) {
+                done(e);
+            }
+        });
+    });
+
+    it("still reads a genuinely empty DEFLATED entry that declares size 0", (done) => {
+        const empty = zlib.deflateRawSync(Buffer.alloc(0));
+        const entry = new Zip(craftBomb(0, 8 /* DEFLATED */, empty, Utils.crc32(Buffer.alloc(0)))).getEntries()[0];
+        expect(entry.getData().length).to.equal(0);
+        entry.getDataAsync((data, err) => {
+            try {
+                expect(err).to.equal(undefined);
+                expect(data.length).to.equal(0);
+                done();
+            } catch (e) {
+                done(e);
+            }
+        });
     });
 });
